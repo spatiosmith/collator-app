@@ -216,24 +216,33 @@ if len(detected_unique) == 0:
     st.stop()
 
 # ---------------------------
-# Mapping Step (Tag-Based)
+# Mapping Initialization (Persist user mapping)
 # ---------------------------
-st.markdown("<div class='card'>", unsafe_allow_html=True)
-st.markdown("### 2) Tag-based mapping — quick and compact")
 
-# Compute AI/fuzzy suggestions
-suggested_map = ai_map_columns(detected_unique, CANONICAL_HEADERS)
+if "mapping" not in st.session_state:
+    st.session_state.mapping = {}
+    for col in detected_unique:
+        tgt, score = suggested_map.get(col, ("--ignore--", 0.0))
+        initial = tgt if (tgt and score >= 0.55) else "--ignore--"
+        st.session_state.mapping[col] = {
+            "mapped": initial,
+            "score": float(score)
+        }
+else:
+    # Ensure new columns are added if new file uploaded
+    for col in detected_unique:
+        if col not in st.session_state.mapping:
+            tgt, score = suggested_map.get(col, ("--ignore--", 0.0))
+            initial = tgt if (tgt and score >= 0.55) else "--ignore--"
+            st.session_state.mapping[col] = {
+                "mapped": initial,
+                "score": float(score)
+            }
 
-# Always reinitialize mapping state when detected columns change
-# We store mapping as: { detected_col: {"mapped": internal_name or '--ignore--', "score": float}}
-mapping_dict = {}
-for col in detected_unique:
-    tgt, score = suggested_map.get(col, (None, 0.0))
-    initial = tgt if (tgt and score >= 0.55) else "--ignore--"
-    mapping_dict[col] = {"mapped": initial, "score": float(score)}
-st.session_state.mapping = mapping_dict
-
-threshold = st.slider("AI similarity threshold (controls default mapping)", min_value=0.0, max_value=0.95, value=0.55, step=0.01)
+# Remove stale columns (columns that no longer exist)
+for col in list(st.session_state.mapping.keys()):
+    if col not in detected_unique:
+        del st.session_state.mapping[col]
 
 # Render tag grid
 st.markdown("<div class='map-grid'>", unsafe_allow_html=True)
@@ -257,17 +266,18 @@ for col in detected_unique:
         </div>
     """, unsafe_allow_html=True)
 
-    # Hidden selectbox to change mapping inline (label hidden)
+    def update_mapping(col):
+    st.session_state.mapping[col]["mapped"] = st.session_state[f"sel__{col}"]
+
     st.selectbox(
         f"select_map_{col}",
         ["--ignore--"] + CANONICAL_HEADERS,
         index=(0 if current_mapped == "--ignore--" else CANONICAL_HEADERS.index(current_mapped) + 1),
         key=f"sel__{col}",
         label_visibility="collapsed",
-        on_change=lambda c=col: st.session_state.mapping[c].update({"mapped": st.session_state[f"sel__{c}"]})
+        on_change=update_mapping,
+        args=(col,)
     )
-st.markdown("</div>", unsafe_allow_html=True)
-st.markdown("</div>", unsafe_allow_html=True)
 
 # ---------------------------
 # Merge Step
@@ -475,6 +485,7 @@ if "merged_df" in st.session_state:
     st.download_button("Download merged_output.xlsx", data=to_excel_bytes(st.session_state.merged_df.rename(columns=PRETTY_MAP)), file_name="merged_output.xlsx")
 
 # End of app
+
 
 
 
