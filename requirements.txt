@@ -1,0 +1,7 @@
+streamlit==1.33.0
+pandas==2.1.4
+pymongo
+openpyxl
+python-dateutil
+sentence-transformers
+numpy
