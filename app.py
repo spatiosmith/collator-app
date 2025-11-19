@@ -25,7 +25,7 @@ CANONICAL_HEADERS_RAW = [
     "Email Address", "Status", "Phone Number", "Employee Size",
     "Industry", "Prospect Linkedin", "Company Website", "Company Linkedin",
     "City", "State", "Country", "Company Address",
-    "Company City", "Company State", "Company Country",
+    "Company City", "Company State", "Postal Code", "Company Country",
 ]
 
 def normalize(s: str) -> str:
@@ -166,7 +166,7 @@ st.markdown(
     """, unsafe_allow_html=True
 )
 
-st.markdown("<div class='topbar'><div class='brand'>Collator — Merge & MongoDB Manager (Deploy-ready)</div></div>", unsafe_allow_html=True)
+st.markdown("<div class='topbar'><div class='brand'>Merge & Store Manager</div></div>", unsafe_allow_html=True)
 
 # ---------------------------
 # Upload Step
@@ -392,9 +392,9 @@ st.markdown("</div>", unsafe_allow_html=True)
 # Duplicate Manager (Prospect LinkedIn)
 # ---------------------------
 st.markdown("<div class='card'>", unsafe_allow_html=True)
-st.markdown("### Duplicate Manager — Prospect LinkedIn")
+st.markdown("### Manage Duplicates")
 
-if st.button("Scan MongoDB for LinkedIn duplicates"):
+if st.button("Scan Database for duplicates"):
     with st.spinner("Scanning..."):
         try:
             client = get_mongo_client()
@@ -475,3 +475,4 @@ if "merged_df" in st.session_state:
     st.download_button("Download merged_output.xlsx", data=to_excel_bytes(st.session_state.merged_df.rename(columns=PRETTY_MAP)), file_name="merged_output.xlsx")
 
 # End of app
+
