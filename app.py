@@ -1,3 +1,4 @@
+# app.py
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -5,318 +6,472 @@ from io import BytesIO
 from pymongo import MongoClient
 from dateutil.parser import parse
 
-# Try AI for auto column matching
+# ---------------------------
+# Configuration & Model
+# ---------------------------
+
+# Try loading AI model; fallback to fuzzy if unavailable.
 try:
     from sentence_transformers import SentenceTransformer, util
     MODEL = SentenceTransformer("all-MiniLM-L6-v2")
     AI_AVAILABLE = True
-except:
+except Exception:
     MODEL = None
     AI_AVAILABLE = False
 
-# ---------------------------
-# Canonical headers (from user)
-# ---------------------------
+# Canonical headers (user-provided)
 CANONICAL_HEADERS_RAW = [
-    "First Name", "Last Name", "Job Title", "Seniority" ,"Company Name",
+    "First Name", "Last Name", "Job Title", "Company Name",
     "Email Address", "Status", "Phone Number", "Employee Size",
     "Industry", "Prospect Linkedin", "Company Website", "Company Linkedin",
     "City", "State", "Country", "Company Address",
-    "Company City", "Company State", "Postal Code", "Company Country", "SIC", "NAICS"
+    "Company City", "Company State", "Company Country",
 ]
 
 def normalize(s: str) -> str:
-    return s.strip().lower().replace(" ", "_")
+    return str(s).strip().lower().replace(" ", "_")
 
 CANONICAL_HEADERS = [normalize(h) for h in CANONICAL_HEADERS_RAW]
 PRETTY_MAP = {normalize(k): k for k in CANONICAL_HEADERS_RAW}
 
 # ---------------------------
-# Mongo Settings
+# MongoDB (use st.secrets in Streamlit Cloud)
 # ---------------------------
-MONGO_URI = "mongodb://localhost:27017/"
-DB_NAME = "master_data"
-COLLECTION_NAME = "records"
+def get_mongo_client():
+    # Requires MONGO_URI in st.secrets on Streamlit Cloud
+    # Example keys in Secrets: MONGO_URI, DB_NAME, COLLECTION_NAME
+    try:
+        uri = st.secrets["MONGO_URI"]
+        return MongoClient(uri)
+    except Exception as e:
+        st.error("MongoDB connection unavailable. Configure MONGO_URI in Streamlit secrets.")
+        st.stop()
 
 # ---------------------------
-# Utils
+# Utilities
 # ---------------------------
+def read_csv_with_fallback(fobj):
+    # Try common encodings
+    try:
+        return pd.read_csv(fobj, dtype=str, keep_default_na=False, encoding="utf-8")
+    except UnicodeDecodeError:
+        try:
+            return pd.read_csv(fobj, dtype=str, keep_default_na=False, encoding="latin1")
+        except Exception:
+            return pd.read_csv(fobj, dtype=str, keep_default_na=False, encoding="ISO-8859-1", engine="python", errors="replace")
 
 def read_file(uploaded):
-    if f.name.lower().endswith(".csv"):
-        # Try utf-8 first, fallback automatically
-        try:
-            return pd.read_csv(f, dtype=str, keep_default_na=False, encoding="utf-8")
-        except UnicodeDecodeError:
-            try:
-                return pd.read_csv(f, dtype=str, keep_default_na=False, encoding="latin1")
-            except:
-                return pd.read_csv(f, dtype=str, keep_default_na=False, encoding="ISO-8859-1")
+    name = uploaded.name.lower()
+    if name.endswith(".csv"):
+        return read_csv_with_fallback(uploaded)
     else:
-        return pd.read_excel(f, dtype=str)
+        # Excel
+        return pd.read_excel(uploaded, dtype=str)
 
-
-def clean_columns(df):
+def clean_columns(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     df.columns = [normalize(c) for c in df.columns]
     df.replace({"": pd.NA, " ": pd.NA}, inplace=True)
     return df
 
-def to_excel_bytes(df):
-    buffer = BytesIO()
-    df.to_excel(buffer, index=False)
-    buffer.seek(0)
-    return buffer.getvalue()
+def to_excel_bytes(df: pd.DataFrame) -> bytes:
+    buf = BytesIO()
+    df.to_excel(buf, index=False)
+    buf.seek(0)
+    return buf.getvalue()
 
-def detect_type(series):
+def detect_type(series: pd.Series) -> str:
     values = series.dropna().astype(str).str.strip()
     if len(values) == 0:
         return "empty"
     tot = len(values)
     ints = floats = bools = dates = 0
     for v in values:
-        v_low = v.lower()
-        if v_low in ("true", "false", "yes", "no", "0", "1"):
-            bools += 1
-            continue
+        vl = v.lower()
+        if vl in ("true","false","yes","no","0","1"):
+            bools += 1; continue
         if v.isdigit():
-            ints += 1
-            continue
+            ints += 1; continue
         try:
-            float(v)
-            floats += 1
-            continue
-        except:
-            pass
+            float(v); floats += 1; continue
+        except: pass
         try:
-            parse(v, fuzzy=True)
-            dates += 1
-            continue
-        except:
-            pass
-    if dates / tot > 0.6: return "date"
-    if ints / tot > 0.6: return "integer"
-    if floats / tot > 0.6: return "float"
-    if bools / tot > 0.6: return "boolean"
+            parse(v, fuzzy=True); dates += 1; continue
+        except: pass
+    if dates/tot > 0.6: return "date"
+    if ints/tot > 0.6: return "integer"
+    if floats/tot > 0.6: return "float"
+    if bools/tot > 0.6: return "boolean"
     return "string"
 
-# AI or fuzzy mapping
-def fuzzy_match(c, candidates):
+def fuzzy_match(col, candidates):
     import difflib
-    best, score = None, 0
-    for tgt in candidates:
-        s = difflib.SequenceMatcher(None, c, tgt).ratio()
+    best, score = None, 0.0
+    for c in candidates:
+        s = difflib.SequenceMatcher(None, col, c).ratio()
         if s > score:
-            best, score = tgt, s
+            best, score = c, s
     return best, score
 
-def ai_map_columns(detected, canonical):
-    if not AI_AVAILABLE:
-        return {c: fuzzy_match(c, canonical) for c in detected}
-    src = MODEL.encode(detected, convert_to_tensor=True)
-    tgt = MODEL.encode(canonical, convert_to_tensor=True)
-    sims = util.cos_sim(src, tgt).cpu().numpy()
+def ai_map_columns(detected_cols, canonical_cols):
+    if not AI_AVAILABLE or MODEL is None:
+        return {c: fuzzy_match(c, canonical_cols) for c in detected_cols}
+    src_emb = MODEL.encode(detected_cols, convert_to_tensor=True)
+    tgt_emb = MODEL.encode(canonical_cols, convert_to_tensor=True)
+    sims = util.cos_sim(src_emb, tgt_emb).cpu().numpy()
     mapping = {}
-    for i, col in enumerate(detected):
+    for i, c in enumerate(detected_cols):
         j = int(np.argmax(sims[i]))
-        mapping[col] = (canonical[j], float(sims[i, j]))
+        mapping[c] = (canonical_cols[j], float(sims[i, j]))
     return mapping
 
-def prepare_for_mongo(df):
-    df = df.where(pd.notnull(df), None)
-    cleaned = []
-    for _, row in df.iterrows():
-        d = {}
+def prepare_for_mongo(df: pd.DataFrame):
+    df2 = df.where(pd.notnull(df), None)
+    out = []
+    for _, row in df2.iterrows():
+        rec = {}
         for k, v in row.items():
-            if isinstance(v, (np.int64, np.int32)): v = int(v)
-            elif isinstance(v, (np.float64, np.float32)): v = float(v)
-            elif v is not None: v = str(v)
-            d[k] = v
-        cleaned.append(d)
-    return cleaned
-
-
-# ---------------------------
-# Modern UI
-# ---------------------------
-st.set_page_config(page_title="Modern Collator", layout="wide")
-
-# Sticky Top Navigation
-st.markdown("""
-<style>
-.bento-box {
-    padding: 18px;
-    border-radius: 14px;
-    background: rgba(10, 10, 10, 0.05);
-    margin-bottom: 20px;
-    border: 1px solid #eee;
-}
-.header {
-    position: sticky;
-    top: 0;
-    background: white;
-    padding: 14px;
-    z-index: 999;
-    border-bottom: 1px solid #ddd;
-}
-</style>
-""", unsafe_allow_html=True)
-
-st.markdown("<div class='header'><h2>⚡ Modern AI Collator + MongoDB</h2></div>", unsafe_allow_html=True)
-
-# Show canonical schema in a bento box
-#with st.container():
- #   st.markdown("<div class='bento-box'>", unsafe_allow_html=True)
-  #  st.markdown("### 📘 Canonical Schema")
-   # st.dataframe(pd.DataFrame({"Final Fields": CANONICAL_HEADERS_RAW}))
-    #st.markdown("</div>", unsafe_allow_html=True)
-
+            if v is None:
+                rec[k] = None
+            elif isinstance(v, (np.integer, np.int64)):
+                rec[k] = int(v)
+            elif isinstance(v, (np.floating, np.float64)):
+                rec[k] = float(v)
+            else:
+                rec[k] = str(v)
+        out.append(rec)
+    return out
 
 # ---------------------------
-# Upload Section
+# UI: dark theme + layout (compact)
 # ---------------------------
-with st.container():
-    st.markdown("<div class='bento-box'>", unsafe_allow_html=True)
-    st.markdown("### 📤 Upload CSV / Excel Files")
-    files = st.file_uploader("Upload multiple files", type=["csv", "xlsx"], accept_multiple_files=True)
-    st.markdown("</div>", unsafe_allow_html=True)
+st.set_page_config(page_title="Collator (Deploy-Ready)", layout="wide")
 
-if not files:
+st.markdown(
+    """
+    <style>
+    .stApp { background: linear-gradient(180deg,#07101c,#071427); color: #e6eef8; }
+    .topbar { position: sticky; top: 0; padding: 12px; background: rgba(5,10,20,0.9); border-bottom: 1px solid rgba(255,255,255,0.03); z-index:999; }
+    .brand { font-weight:700; color:#cfe6ff; font-size:18px; }
+    .card { background: linear-gradient(180deg, rgba(255,255,255,0.02), rgba(255,255,255,0.01)); padding:14px; border-radius:10px; border:1px solid rgba(255,255,255,0.03); margin-bottom:12px; }
+    .map-grid { display:grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap:12px; margin-top:12px; }
+    .map-tag { background:#0f1a2b; padding:12px; border-radius:10px; border:1px solid rgba(255,255,255,0.03); }
+    .map-title { color:#dbeeff; font-weight:600; }
+    .map-selected { margin-top:8px; display:inline-block; background:#162235; padding:6px 10px; border-radius:8px; color:#9fc7ff; border:1px solid rgba(255,255,255,0.03); cursor:pointer; }
+    .map-score { color:#9fb8ff; font-size:12px; margin-top:6px; }
+    .stepper { display:flex; gap:10px; margin-bottom:12px; }
+    .step { flex:1; padding:10px; border-radius:8px; background:#081223; color:#a7c8ff; text-align:center; font-weight:600; border:1px solid rgba(255,255,255,0.02); }
+    .muted { color:#9fb8ff; font-size:13px; }
+    </style>
+    """, unsafe_allow_html=True
+)
+
+st.markdown("<div class='topbar'><div class='brand'>Collator — Merge & MongoDB Manager (Deploy-ready)</div></div>", unsafe_allow_html=True)
+
+# ---------------------------
+# Upload Step
+# ---------------------------
+st.markdown("<div class='card'>", unsafe_allow_html=True)
+st.markdown("### 1) Upload CSV / Excel files")
+uploaded_files = st.file_uploader("Upload CSV or XLSX files (multiple)", accept_multiple_files=True, type=["csv", "xlsx"])
+st.markdown("</div>", unsafe_allow_html=True)
+
+if not uploaded_files:
+    st.info("Upload one or more files to start.")
+    st.stop()
+
+# Read files robustly and collect detected columns
+dfs = []
+detected_all = []
+read_errors = []
+for f in uploaded_files:
+    try:
+        df = read_file(f)
+        df = clean_columns(df)
+        # If duplicate columns in the file, rename duplicates to keep unique internal names
+        if df.columns.duplicated().any():
+            new_cols = []
+            seen = {}
+            for c in df.columns:
+                if c not in seen:
+                    seen[c] = 1
+                    new_cols.append(c)
+                else:
+                    seen[c] += 1
+                    new_cols.append(f"{c}__dup{seen[c]}")
+            df.columns = new_cols
+        dfs.append(df)
+        detected_all.extend(df.columns)
+        st.write(f"Loaded **{f.name}** — rows: {df.shape[0]}, columns: {len(df.columns)}")
+    except Exception as e:
+        read_errors.append((f.name, str(e)))
+        st.error(f"Failed to read {f.name}: {e}")
+
+if read_errors:
+    st.warning("Some files failed to load — see messages above.")
+
+detected_unique = sorted(set(detected_all))
+if len(detected_unique) == 0:
+    st.error("No columns detected in uploaded files.")
     st.stop()
 
 # ---------------------------
-# Load files
+# Mapping Step (Tag-Based)
 # ---------------------------
-cleaned_dfs = []
-detected_cols_all = []
+st.markdown("<div class='card'>", unsafe_allow_html=True)
+st.markdown("### 2) Tag-based mapping — quick and compact")
 
-for f in files:
-    df = read_file(f)
-    df = clean_columns(df)
-    cleaned_dfs.append(df)
-    detected_cols_all.extend(df.columns)
+# Compute AI/fuzzy suggestions
+suggested_map = ai_map_columns(detected_unique, CANONICAL_HEADERS)
 
-detected_unique = sorted(set(detected_cols_all))
+# Always reinitialize mapping state when detected columns change
+# We store mapping as: { detected_col: {"mapped": internal_name or '--ignore--', "score": float}}
+mapping_dict = {}
+for col in detected_unique:
+    tgt, score = suggested_map.get(col, (None, 0.0))
+    initial = tgt if (tgt and score >= 0.55) else "--ignore--"
+    mapping_dict[col] = {"mapped": initial, "score": float(score)}
+st.session_state.mapping = mapping_dict
+
+threshold = st.slider("AI similarity threshold (controls default mapping)", min_value=0.0, max_value=0.95, value=0.55, step=0.01)
+
+# Render tag grid
+st.markdown("<div class='map-grid'>", unsafe_allow_html=True)
+for col in detected_unique:
+    info = st.session_state.mapping.get(col, {"mapped": "--ignore--", "score": 0.0})
+    score = info["score"]
+    ai_tgt, ai_score = suggested_map.get(col, (None, 0.0))
+    # determine display value: current mapping in session_state (user editable)
+    current_mapped = st.session_state.mapping[col]["mapped"]
+    display_label = PRETTY_MAP.get(current_mapped, current_mapped)
+
+    icon = "✓" if current_mapped != "--ignore--" else "⚠"
+
+    # Tag card
+    st.markdown(f"""
+        <div class='map-tag'>
+            <div class='map-title'>{col} <span style='float:right;color:{"#4beb9b" if icon=="✓" else "#ffd36b"}; font-weight:700'>{icon}</span></div>
+            <div class='muted'>Suggested: {PRETTY_MAP.get(ai_tgt, ai_tgt) if ai_tgt else '--'}</div>
+            <div class='map-selected' onclick="document.getElementById('sel__{col}').click();">{display_label}</div>
+            <div class='map-score'>AI score: {score:.2f}</div>
+        </div>
+    """, unsafe_allow_html=True)
+
+    # Hidden selectbox to change mapping inline (label hidden)
+    st.selectbox(
+        f"select_map_{col}",
+        ["--ignore--"] + CANONICAL_HEADERS,
+        index=(0 if current_mapped == "--ignore--" else CANONICAL_HEADERS.index(current_mapped) + 1),
+        key=f"sel__{col}",
+        label_visibility="collapsed",
+        on_change=lambda c=col: st.session_state.mapping[c].update({"mapped": st.session_state[f"sel__{c}"]})
+    )
+st.markdown("</div>", unsafe_allow_html=True)
+st.markdown("</div>", unsafe_allow_html=True)
 
 # ---------------------------
-# Mapping Section
+# Merge Step
 # ---------------------------
-with st.container():
-    st.markdown("<div class='bento-box'>", unsafe_allow_html=True)
-    st.markdown("### 🤖 AI Column Mapping")
-    
-    threshold = st.slider("Similarity Threshold", 0.0, 0.95, 0.50, 0.01)
+st.markdown("<div class='card'>", unsafe_allow_html=True)
+st.markdown("### 3) Merge into canonical schema")
 
-    suggested = ai_map_columns(detected_unique, CANONICAL_HEADERS)
-
-    mapping = {}
-    for col in detected_unique:
-        target, score = suggested[col]
-        if score < threshold:
-            target = "--ignore--"
-        mapping[col] = st.selectbox(
-            f"Map '{col}' →",
-            ["--ignore--"] + CANONICAL_HEADERS,
-            index=(0 if target == "--ignore--" else CANONICAL_HEADERS.index(target) + 1)
-        )
-    st.markdown("</div>", unsafe_allow_html=True)
-
-# ---------------------------
-# Merge Section
-# ---------------------------
-with st.container():
-    st.markdown("<div class='bento-box'>", unsafe_allow_html=True)
-    st.markdown("### 🔄 Merge Files")
-
-    if st.button("Merge Files"):
+if st.button("Merge Now"):
+    with st.spinner("Merging files..."):
         final_frames = []
-
-        for df in cleaned_dfs:
+        problems = []
+        for df in dfs:
             dfw = df.copy()
-            # rename
+            # Build rename map for this df based on mapping
             rename_map = {}
-            for old in dfw.columns:
-                new = mapping.get(old, "--ignore--")
-                if new != "--ignore--":
-                    rename_map[old] = new
-            dfw.rename(columns=rename_map, inplace=True)
+            for old_col in list(dfw.columns):
+                mapped = st.session_state.mapping.get(old_col, {"mapped": "--ignore--"})["mapped"]
+                if mapped != "--ignore--":
+                    # collision handling: if canonical already exists in this df, write to a temp name
+                    if mapped in dfw.columns:
+                        rename_map[old_col] = f"{mapped}__from__{old_col}"
+                    else:
+                        rename_map[old_col] = mapped
+            if rename_map:
+                dfw.rename(columns=rename_map, inplace=True)
 
-            # keep only canonical fields
-            dfw = dfw[[c for c in dfw.columns if c in CANONICAL_HEADERS]]
+            # Keep only canonical columns and temp variants
+            cols_keep = [c for c in dfw.columns if (c in CANONICAL_HEADERS) or any(c.startswith(t + "__from__") for t in CANONICAL_HEADERS)]
+            dfw = dfw[cols_keep].copy()
 
-            # ensure all canonical fields exist
+            # Collapse temp variants: prefer left-to-right first non-null
+            for canonical in CANONICAL_HEADERS:
+                temp_cols = [c for c in dfw.columns if c == canonical or c.startswith(canonical + "__from__")]
+                if len(temp_cols) > 1:
+                    dfw[canonical] = dfw[temp_cols].bfill(axis=1).iloc[:, 0]
+                    for c in temp_cols:
+                        if c != canonical:
+                            dfw.drop(columns=[c], inplace=True)
+                elif len(temp_cols) == 1 and temp_cols[0] != canonical:
+                    dfw.rename(columns={temp_cols[0]: canonical}, inplace=True)
+
+            # Ensure all canonical columns present
             for c in CANONICAL_HEADERS:
                 if c not in dfw.columns:
                     dfw[c] = pd.NA
 
+            # Reorder to canonical schema and drop duplicates
             dfw = dfw[CANONICAL_HEADERS]
             dfw = dfw.loc[:, ~dfw.columns.duplicated()]
 
+            if dfw.columns.duplicated().any():
+                problems.append("Duplicate columns remain after processing a file.")
             final_frames.append(dfw)
 
-        merged = pd.concat(final_frames, ignore_index=True)
-        st.session_state["merged_df"] = merged
-        
-        st.success(f"Merged {len(files)} file(s) → {merged.shape[0]} rows.")
-        st.dataframe(merged.rename(columns=PRETTY_MAP).head(200))
+        if not final_frames:
+            st.error("No frames to merge. Check mappings.")
+        else:
+            try:
+                merged = pd.concat(final_frames, ignore_index=True, sort=False)
+            except Exception as e:
+                st.error(f"Merge failed: {e}")
+                st.stop()
 
+            st.session_state.merged_df = merged
+            st.success(f"Merged {len(final_frames)} files → {merged.shape[0]} rows × {merged.shape[1]} cols")
+            st.dataframe(merged.rename(columns=PRETTY_MAP).head(200))
+
+st.markdown("</div>", unsafe_allow_html=True)
+
+# ---------------------------
+# Preview & Schema Report
+# ---------------------------
+if "merged_df" in st.session_state:
+    st.markdown("<div class='card'>", unsafe_allow_html=True)
+    st.markdown("### Preview")
+    st.dataframe(st.session_state.merged_df.rename(columns=PRETTY_MAP).head(200))
     st.markdown("</div>", unsafe_allow_html=True)
 
+    st.markdown("<div class='card'>", unsafe_allow_html=True)
+    st.markdown("### Schema Report")
+    schema = pd.DataFrame({
+        "Field": CANONICAL_HEADERS_RAW,
+        "internal": CANONICAL_HEADERS,
+        "Detected Type": [detect_type(st.session_state.merged_df[c]) for c in CANONICAL_HEADERS],
+        "% Empty": [st.session_state.merged_df[c].isna().mean()*100 for c in CANONICAL_HEADERS]
+    })
+    st.dataframe(schema)
+    st.download_button("Download schema_report.xlsx", data=to_excel_bytes(schema), file_name="schema_report.xlsx")
+    st.markdown("</div>", unsafe_allow_html=True)
 
 # ---------------------------
-# Mongo Upload (GLOBAL BUTTON)
+# Upload to MongoDB (safe)
 # ---------------------------
-with st.container():
-    st.markdown("<div class='bento-box'>", unsafe_allow_html=True)
-    st.markdown("### 🗄 Upload to MongoDB")
+st.markdown("<div class='card'>", unsafe_allow_html=True)
+st.markdown("### 4) Upload to MongoDB")
 
-    if "merged_df" not in st.session_state:
-        st.info("Merge files first.")
-    else:
-        merged_df = st.session_state["merged_df"]
+if "merged_df" not in st.session_state:
+    st.info("Merge first to enable upload.")
+else:
+    st.markdown("<div style='display:flex;gap:12px;align-items:center'>", unsafe_allow_html=True)
+    st.markdown(f"<div class='muted'>DB:</div><div style='font-weight:700'>{st.secrets.get('DB_NAME','<set DB_NAME>')}.{st.secrets.get('COLLECTION_NAME','<set COLLECTION_NAME>')}</div>", unsafe_allow_html=True)
+    st.markdown("</div>", unsafe_allow_html=True)
 
-        if st.button("📥 Upload to MongoDB"):
+    if st.button("Upload to MongoDB"):
+        with st.spinner("Uploading to MongoDB..."):
             try:
-                records = prepare_for_mongo(merged_df)
-                client = MongoClient(MONGO_URI)
-                coll = client[DB_NAME][COLLECTION_NAME]
-                res = coll.insert_many(records)
-
-                st.success(f"Uploaded {len(res.inserted_ids)} records to MongoDB.")
-                st.toast("Upload Successful!", icon="✔️")
+                client = get_mongo_client()
+                db = client[st.secrets["DB_NAME"]]
+                coll = db[st.secrets["COLLECTION_NAME"]]
+                records = prepare_for_mongo(st.session_state.merged_df)
+                if len(records) == 0:
+                    st.warning("No records to insert.")
+                else:
+                    res = coll.insert_many(records)
+                    st.success(f"Uploaded {len(res.inserted_ids)} documents to MongoDB.")
             except Exception as e:
                 st.error(f"Upload failed: {e}")
-                st.toast("Upload Failed!", icon="❌")
 
-    st.markdown("</div>", unsafe_allow_html=True)
-
+st.markdown("</div>", unsafe_allow_html=True)
 
 # ---------------------------
-# Download Outputs
+# Duplicate Manager (Prospect LinkedIn)
 # ---------------------------
-with st.container():
-    st.markdown("<div class='bento-box'>", unsafe_allow_html=True)
-    st.markdown("### ⬇ Download Outputs")
+st.markdown("<div class='card'>", unsafe_allow_html=True)
+st.markdown("### Duplicate Manager — Prospect LinkedIn")
 
-    if "merged_df" in st.session_state:
-        merged_pretty = st.session_state["merged_df"].rename(columns=PRETTY_MAP)
-        
-        st.download_button(
-            "Download Merged Excel",
-            data=to_excel_bytes(merged_pretty),
-            file_name="merged_output.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-        )
+if st.button("Scan MongoDB for LinkedIn duplicates"):
+    with st.spinner("Scanning..."):
+        try:
+            client = get_mongo_client()
+            db = client[st.secrets["DB_NAME"]]
+            coll = db[st.secrets["COLLECTION_NAME"]]
+            pipeline = [
+                {"$group": {"_id": "$prospect_linkedin", "count": {"$sum": 1}, "ids": {"$push": "$_id"}, "docs": {"$push": "$$ROOT"}}},
+                {"$match": {"_id": {"$ne": None}, "count": {"$gt": 1}}}
+            ]
+            dup_groups = list(coll.aggregate(pipeline))
+            if not dup_groups:
+                st.success("No duplicates found by prospect_linkedin.")
+                st.session_state.duplicates = []
+            else:
+                st.warning(f"Found {len(dup_groups)} duplicate groups by prospect_linkedin.")
+                st.session_state.duplicates = dup_groups
+        except Exception as e:
+            st.error(f"Scan failed: {e}")
 
-        schema_df = pd.DataFrame({
-            "Field": CANONICAL_HEADERS_RAW,
-            "Type": [detect_type(st.session_state["merged_df"][normalize(h)]) for h in CANONICAL_HEADERS_RAW],
-            "% Empty": [st.session_state["merged_df"][normalize(h)].isna().mean() * 100 for h in CANONICAL_HEADERS_RAW]
-        })
-        st.download_button(
-            "Download Schema Report",
-            data=to_excel_bytes(schema_df),
-            file_name="schema_report.xlsx"
-        )
+# Show duplicates if present
+if "duplicates" in st.session_state and st.session_state.duplicates:
+    for group in st.session_state.duplicates:
+        key = group["_id"]
+        docs = group["docs"]
+        ids = group["ids"]
+        st.markdown(f"#### LinkedIn: `{key}` — {len(ids)} records")
+        df_dup = pd.DataFrame(docs)
+        st.dataframe(df_dup)
+        st.download_button(f"Download group {key}", data=to_excel_bytes(df_dup), file_name=f"duplicates_{key}.xlsx")
 
-    st.markdown("</div>", unsafe_allow_html=True)
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            if st.button(f"Keep FIRST and delete others ({key})"):
+                try:
+                    client = get_mongo_client()
+                    db = client[st.secrets["DB_NAME"]]
+                    coll = db[st.secrets["COLLECTION_NAME"]]
+                    to_remove = ids[1:]
+                    if to_remove:
+                        coll.delete_many({"_id": {"$in": to_remove}})
+                        st.success(f"Deleted {len(to_remove)} docs (kept first).")
+                    else:
+                        st.info("Only one doc present.")
+                except Exception as e:
+                    st.error(f"Delete failed: {e}")
+        with c2:
+            if st.button(f"Keep LAST and delete others ({key})"):
+                try:
+                    client = get_mongo_client()
+                    db = client[st.secrets["DB_NAME"]]
+                    coll = db[st.secrets["COLLECTION_NAME"]]
+                    to_remove = ids[:-1]
+                    if to_remove:
+                        coll.delete_many({"_id": {"$in": to_remove}})
+                        st.success(f"Deleted {len(to_remove)} docs (kept last).")
+                    else:
+                        st.info("Only one doc present.")
+                except Exception as e:
+                    st.error(f"Delete failed: {e}")
+        with c3:
+            if st.button(f"Delete ALL ({key})"):
+                try:
+                    client = get_mongo_client()
+                    db = client[st.secrets["DB_NAME"]]
+                    coll = db[st.secrets["COLLECTION_NAME"]]
+                    coll.delete_many({"_id": {"$in": ids}})
+                    st.success(f"Deleted all {len(ids)} docs in group.")
+                except Exception as e:
+                    st.error(f"Delete failed: {e}")
+        st.markdown("---")
+
+st.markdown("</div>", unsafe_allow_html=True)
+
+# ---------------------------
+# Downloads
+# ---------------------------
+if "merged_df" in st.session_state:
+    st.download_button("Download merged_output.xlsx", data=to_excel_bytes(st.session_state.merged_df.rename(columns=PRETTY_MAP)), file_name="merged_output.xlsx")
+
+# End of app
