@@ -1,0 +1,2 @@
+# collator-app
+just collate.
