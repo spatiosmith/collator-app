@@ -1,4 +1,12 @@
 # app.py
+# Data Collator
+# - Tag-based mapping
+# - Mapping persistence
+# - Canonical schema
+# - Conflict resolution
+# - All canonical fields uploaded to Database
+
+
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -21,7 +29,7 @@ except Exception:
 
 # Canonical headers (user-provided)
 CANONICAL_HEADERS_RAW = [
-    "First Name", "Last Name", "Job Title", "Company Name", "Seniority",
+    "First Name", "Last Name", "Job Title", "Seniority", "Company Name",
     "Email Address", "Status", "Phone Number", "Employee Size",
     "Industry", "Prospect Linkedin", "Company Website", "Company Linkedin",
     "City", "State", "Country", "Company Address",
@@ -38,12 +46,10 @@ PRETTY_MAP = {normalize(k): k for k in CANONICAL_HEADERS_RAW}
 # MongoDB (use st.secrets in Streamlit Cloud)
 # ---------------------------
 def get_mongo_client():
-    # Requires MONGO_URI in st.secrets on Streamlit Cloud
-    # Example keys in Secrets: MONGO_URI, DB_NAME, COLLECTION_NAME
     try:
         uri = st.secrets["MONGO_URI"]
         return MongoClient(uri)
-    except Exception as e:
+    except Exception:
         st.error("MongoDB connection unavailable. Configure MONGO_URI in Streamlit secrets.")
         st.stop()
 
@@ -51,7 +57,6 @@ def get_mongo_client():
 # Utilities
 # ---------------------------
 def read_csv_with_fallback(fobj):
-    # Try common encodings
     try:
         return pd.read_csv(fobj, dtype=str, keep_default_na=False, encoding="utf-8")
     except UnicodeDecodeError:
@@ -61,11 +66,18 @@ def read_csv_with_fallback(fobj):
             return pd.read_csv(fobj, dtype=str, keep_default_na=False, encoding="ISO-8859-1", engine="python", errors="replace")
 
 def read_file(uploaded):
+    # support passing a local path string for quick testing
+    if isinstance(uploaded, str):
+        if uploaded.lower().endswith('.csv'):
+            with open(uploaded, 'rb') as f:
+                return read_csv_with_fallback(f)
+        else:
+            return pd.read_excel(uploaded, dtype=str)
+
     name = uploaded.name.lower()
     if name.endswith(".csv"):
         return read_csv_with_fallback(uploaded)
     else:
-        # Excel
         return pd.read_excel(uploaded, dtype=str)
 
 def clean_columns(df: pd.DataFrame) -> pd.DataFrame:
@@ -173,12 +185,19 @@ st.markdown("<div class='topbar'><div class='brand'>Merge & Store Manager</div><
 # ---------------------------
 st.markdown("<div class='card'>", unsafe_allow_html=True)
 st.markdown("### 1) Upload CSV / Excel files")
-uploaded_files = st.file_uploader("Upload CSV or XLSX files (multiple)", accept_multiple_files=True, type=["csv", "xlsx"])
+uploaded_files = st.file_uploader("Upload CSV or XLSX files (multiple)", accept_multiple_files=True, type=["csv", "xlsx"]) 
 st.markdown("</div>", unsafe_allow_html=True)
 
+# Allow quick testing with SAMPLE_FILE_PATH if no interactive upload provided
 if not uploaded_files:
-    st.info("Upload one or more files to start.")
-    st.stop()
+    st.info("No files uploaded — using sample file for local testing if present.")
+    try:
+        # try loading sample path if exists
+        _df_test = read_file(SAMPLE_FILE_PATH)
+        st.info(f"Loaded sample file: {SAMPLE_FILE_PATH}")
+        uploaded_files = [SAMPLE_FILE_PATH]
+    except Exception:
+        st.stop()
 
 # Read files robustly and collect detected columns
 dfs = []
@@ -202,13 +221,14 @@ for f in uploaded_files:
             df.columns = new_cols
         dfs.append(df)
         detected_all.extend(df.columns)
-        st.write(f"Loaded **{f.name}** — rows: {df.shape[0]}, columns: {len(df.columns)}")
+        st.write(f"Loaded **{f if isinstance(f,str) else f.name}** — rows: {df.shape[0]}, columns: {len(df.columns)}")
     except Exception as e:
-        read_errors.append((f.name, str(e)))
-        st.error(f"Failed to read {f.name}: {e}")
+        read_errors.append((f if isinstance(f,str) else f.name, str(e)))
+        st.error(f"Failed to read {f if isinstance(f,str) else f.name}: {e}")
 
 if read_errors:
     st.warning("Some files failed to load — see messages above.")
+
 
 detected_unique = sorted(set(detected_all))
 if len(detected_unique) == 0:
@@ -216,33 +236,40 @@ if len(detected_unique) == 0:
     st.stop()
 
 # ---------------------------
-# Mapping Initialization (Persist user mapping)
+# Mapping Step (Tag-Based) — fixed persistence
 # ---------------------------
+st.markdown("<div class='card'>", unsafe_allow_html=True)
+st.markdown("### 2) Tag-based mapping — quick and persistent")
 
+# Compute AI/fuzzy suggestions
+suggested_map = ai_map_columns(detected_unique, CANONICAL_HEADERS)
+
+# Initialize mapping in session state if not present; preserve existing user choices
 if "mapping" not in st.session_state:
     st.session_state.mapping = {}
-    for col in detected_unique:
-        tgt, score = suggested_map.get(col, ("--ignore--", 0.0))
-        initial = tgt if (tgt and score >= 0.55) else "--ignore--"
-        st.session_state.mapping[col] = {
-            "mapped": initial,
-            "score": float(score)
-        }
-else:
-    # Ensure new columns are added if new file uploaded
-    for col in detected_unique:
-        if col not in st.session_state.mapping:
-            tgt, score = suggested_map.get(col, ("--ignore--", 0.0))
-            initial = tgt if (tgt and score >= 0.55) else "--ignore--"
-            st.session_state.mapping[col] = {
-                "mapped": initial,
-                "score": float(score)
-            }
 
-# Remove stale columns (columns that no longer exist)
+# Add new columns (or update scores) without overwriting user's mapped choices
+for col in detected_unique:
+    tgt, score = suggested_map.get(col, (None, 0.0))
+    if col not in st.session_state.mapping:
+        initial = tgt if (tgt and score >= 0.50) else "--ignore--"
+        st.session_state.mapping[col] = {"mapped": initial, "score": float(score)}
+    else:
+        # update score and ensure entry has mapped key
+        st.session_state.mapping[col]["score"] = float(score)
+        if "mapped" not in st.session_state.mapping[col]:
+            st.session_state.mapping[col]["mapped"] = tgt if (tgt and score >= 0.50) else "--ignore--"
+
+# Remove stale columns
 for col in list(st.session_state.mapping.keys()):
     if col not in detected_unique:
         del st.session_state.mapping[col]
+
+threshold = st.slider("AI similarity threshold", min_value=0.0, max_value=0.95, value=0.55, step=0.01)
+
+# helper to update mapping from selectbox
+def update_mapping(col):
+    st.session_state.mapping[col]["mapped"] = st.session_state.get(f"sel__{col}")
 
 # Render tag grid
 st.markdown("<div class='map-grid'>", unsafe_allow_html=True)
@@ -250,13 +277,10 @@ for col in detected_unique:
     info = st.session_state.mapping.get(col, {"mapped": "--ignore--", "score": 0.0})
     score = info["score"]
     ai_tgt, ai_score = suggested_map.get(col, (None, 0.0))
-    # determine display value: current mapping in session_state (user editable)
     current_mapped = st.session_state.mapping[col]["mapped"]
     display_label = PRETTY_MAP.get(current_mapped, current_mapped)
-
     icon = "✓" if current_mapped != "--ignore--" else "⚠"
 
-    # Tag card
     st.markdown(f"""
         <div class='map-tag'>
             <div class='map-title'>{col} <span style='float:right;color:{"#4beb9b" if icon=="✓" else "#ffd36b"}; font-weight:700'>{icon}</span></div>
@@ -266,18 +290,18 @@ for col in detected_unique:
         </div>
     """, unsafe_allow_html=True)
 
-def update_mapping(col):
-    st.session_state.mapping[col]["mapped"] = st.session_state[f"sel__{col}"]
-
     st.selectbox(
         f"select_map_{col}",
         ["--ignore--"] + CANONICAL_HEADERS,
-        index=(0 if current_mapped == "--ignore--" else CANONICAL_HEADERS.index(current_mapped) + 1),
+        index=(0 if current_mapped == "--ignore--" else (CANONICAL_HEADERS.index(current_mapped) + 1)),
         key=f"sel__{col}",
         label_visibility="collapsed",
         on_change=update_mapping,
         args=(col,)
     )
+
+st.markdown("</div>", unsafe_allow_html=True)
+st.markdown("</div>", unsafe_allow_html=True)
 
 # ---------------------------
 # Merge Step
@@ -308,7 +332,7 @@ if st.button("Merge Now"):
             cols_keep = [c for c in dfw.columns if (c in CANONICAL_HEADERS) or any(c.startswith(t + "__from__") for t in CANONICAL_HEADERS)]
             dfw = dfw[cols_keep].copy()
 
-            # Collapse temp variants: prefer left-to-right first non-null
+            # Collapse temp variants: prefer left-to-right first non-null (Option A)
             for canonical in CANONICAL_HEADERS:
                 temp_cols = [c for c in dfw.columns if c == canonical or c.startswith(canonical + "__from__")]
                 if len(temp_cols) > 1:
@@ -372,7 +396,7 @@ if "merged_df" in st.session_state:
 # Upload to MongoDB (safe)
 # ---------------------------
 st.markdown("<div class='card'>", unsafe_allow_html=True)
-st.markdown("### 4) Upload to MongoDB")
+st.markdown("### 4) Upload to Database")
 
 if "merged_df" not in st.session_state:
     st.info("Merge first to enable upload.")
@@ -399,94 +423,9 @@ else:
 st.markdown("</div>", unsafe_allow_html=True)
 
 # ---------------------------
-# Duplicate Manager (Prospect LinkedIn)
-# ---------------------------
-st.markdown("<div class='card'>", unsafe_allow_html=True)
-st.markdown("### Manage Duplicates")
-
-if st.button("Scan Database for duplicates"):
-    with st.spinner("Scanning..."):
-        try:
-            client = get_mongo_client()
-            db = client[st.secrets["DB_NAME"]]
-            coll = db[st.secrets["COLLECTION_NAME"]]
-            pipeline = [
-                {"$group": {"_id": "$prospect_linkedin", "count": {"$sum": 1}, "ids": {"$push": "$_id"}, "docs": {"$push": "$$ROOT"}}},
-                {"$match": {"_id": {"$ne": None}, "count": {"$gt": 1}}}
-            ]
-            dup_groups = list(coll.aggregate(pipeline))
-            if not dup_groups:
-                st.success("No duplicates found by prospect_linkedin.")
-                st.session_state.duplicates = []
-            else:
-                st.warning(f"Found {len(dup_groups)} duplicate groups by prospect_linkedin.")
-                st.session_state.duplicates = dup_groups
-        except Exception as e:
-            st.error(f"Scan failed: {e}")
-
-# Show duplicates if present
-if "duplicates" in st.session_state and st.session_state.duplicates:
-    for group in st.session_state.duplicates:
-        key = group["_id"]
-        docs = group["docs"]
-        ids = group["ids"]
-        st.markdown(f"#### LinkedIn: `{key}` — {len(ids)} records")
-        df_dup = pd.DataFrame(docs)
-        st.dataframe(df_dup)
-        st.download_button(f"Download group {key}", data=to_excel_bytes(df_dup), file_name=f"duplicates_{key}.xlsx")
-
-        c1, c2, c3 = st.columns(3)
-        with c1:
-            if st.button(f"Keep FIRST and delete others ({key})"):
-                try:
-                    client = get_mongo_client()
-                    db = client[st.secrets["DB_NAME"]]
-                    coll = db[st.secrets["COLLECTION_NAME"]]
-                    to_remove = ids[1:]
-                    if to_remove:
-                        coll.delete_many({"_id": {"$in": to_remove}})
-                        st.success(f"Deleted {len(to_remove)} docs (kept first).")
-                    else:
-                        st.info("Only one doc present.")
-                except Exception as e:
-                    st.error(f"Delete failed: {e}")
-        with c2:
-            if st.button(f"Keep LAST and delete others ({key})"):
-                try:
-                    client = get_mongo_client()
-                    db = client[st.secrets["DB_NAME"]]
-                    coll = db[st.secrets["COLLECTION_NAME"]]
-                    to_remove = ids[:-1]
-                    if to_remove:
-                        coll.delete_many({"_id": {"$in": to_remove}})
-                        st.success(f"Deleted {len(to_remove)} docs (kept last).")
-                    else:
-                        st.info("Only one doc present.")
-                except Exception as e:
-                    st.error(f"Delete failed: {e}")
-        with c3:
-            if st.button(f"Delete ALL ({key})"):
-                try:
-                    client = get_mongo_client()
-                    db = client[st.secrets["DB_NAME"]]
-                    coll = db[st.secrets["COLLECTION_NAME"]]
-                    coll.delete_many({"_id": {"$in": ids}})
-                    st.success(f"Deleted all {len(ids)} docs in group.")
-                except Exception as e:
-                    st.error(f"Delete failed: {e}")
-        st.markdown("---")
-
-st.markdown("</div>", unsafe_allow_html=True)
-
-# ---------------------------
 # Downloads
 # ---------------------------
 if "merged_df" in st.session_state:
     st.download_button("Download merged_output.xlsx", data=to_excel_bytes(st.session_state.merged_df.rename(columns=PRETTY_MAP)), file_name="merged_output.xlsx")
 
 # End of app
-
-
-
-
-
