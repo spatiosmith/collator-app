@@ -266,7 +266,7 @@ for col in detected_unique:
         </div>
     """, unsafe_allow_html=True)
 
-    def update_mapping(col):
+def update_mapping(col):
     st.session_state.mapping[col]["mapped"] = st.session_state[f"sel__{col}"]
 
     st.selectbox(
@@ -485,6 +485,7 @@ if "merged_df" in st.session_state:
     st.download_button("Download merged_output.xlsx", data=to_excel_bytes(st.session_state.merged_df.rename(columns=PRETTY_MAP)), file_name="merged_output.xlsx")
 
 # End of app
+
 
 
 
