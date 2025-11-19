@@ -25,7 +25,7 @@ CANONICAL_HEADERS_RAW = [
     "Email Address", "Status", "Phone Number", "Employee Size",
     "Industry", "Prospect Linkedin", "Company Website", "Company Linkedin",
     "City", "State", "Country", "Company Address",
-    "Company City", "Company State", "Postal Code", "Company Country", "SIC", "NAICS,
+    "Company City", "Company State", "Postal Code", "Company Country", "SIC", "NAICS",
 ]
 
 def normalize(s: str) -> str:
@@ -475,5 +475,6 @@ if "merged_df" in st.session_state:
     st.download_button("Download merged_output.xlsx", data=to_excel_bytes(st.session_state.merged_df.rename(columns=PRETTY_MAP)), file_name="merged_output.xlsx")
 
 # End of app
+
 
 
