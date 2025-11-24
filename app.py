@@ -22,7 +22,22 @@ from typing import Dict, Optional, Tuple
 
 # Path to your local SQLite DB with email patterns
 # Make sure this file exists in the same directory as app.py (or adjust the path).
-PATTERN_DB_PATH = r"https://pub-17d84e44759e445b88b8626c227d8cf4.r2.dev/email_patterns.db"
+PATTERN_DB_URL = "https://pub-17d84e44759e445b88b8626c227d8cf4.r2.dev/email_patterns.db"
+PATTERN_DB_LOCAL = "email_patterns.db"
+
+def ensure_local_pattern_db():
+    """Download the .db file from remote URL if not already local."""
+    if os.path.exists(PATTERN_DB_LOCAL):
+        return PATTERN_DB_LOCAL
+    try:
+        r = requests.get(PATTERN_DB_URL, timeout=10)
+        r.raise_for_status()
+        with open(PATTERN_DB_LOCAL, "wb") as f:
+            f.write(r.content)
+        return PATTERN_DB_LOCAL
+    except Exception as e:
+        st.error(f"Failed to download email pattern DB: {e}")
+        return None
 
 # Try loading AI model; fallback to fuzzy if unavailable.
 try:
@@ -657,4 +672,5 @@ if "merged_df" in st.session_state:
     )
 
 # End of app
+
 
