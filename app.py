@@ -15,6 +15,8 @@ from pymongo import MongoClient
 from dateutil.parser import parse
 import sqlite3
 from typing import Dict, Optional, Tuple
+import os
+import requests
 
 # ---------------------------
 # Configuration & Model
@@ -673,6 +675,7 @@ if "merged_df" in st.session_state:
     )
 
 # End of app
+
 
 
 
