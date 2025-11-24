@@ -536,7 +536,8 @@ if st.button("Merge Now"):
         problems = []
 
         # Load email patterns once for the whole merge operation
-        email_patterns = get_email_pattern_cache()
+        local_db = ensure_local_pattern_db()
+        email_patterns = get_email_pattern_cache() if local_db else {}
 
         for df in dfs:
             dfw = df.copy()
@@ -672,5 +673,6 @@ if "merged_df" in st.session_state:
     )
 
 # End of app
+
 
 
