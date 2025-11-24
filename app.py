@@ -22,7 +22,7 @@ from typing import Dict, Optional, Tuple
 
 # Path to your local SQLite DB with email patterns
 # Make sure this file exists in the same directory as app.py (or adjust the path).
-PATTERN_DB_PATH = "email_patterns.db"
+PATTERN_DB_PATH = r"https://pub-17d84e44759e445b88b8626c227d8cf4.r2.dev/email_patterns.db"
 
 # Try loading AI model; fallback to fuzzy if unavailable.
 try:
@@ -657,3 +657,4 @@ if "merged_df" in st.session_state:
     )
 
 # End of app
+
