@@ -26,6 +26,7 @@ import requests
 # Make sure this file exists in the same directory as app.py (or adjust the path).
 PATTERN_DB_URL = "https://pub-17d84e44759e445b88b8626c227d8cf4.r2.dev/email_patterns.db"
 PATTERN_DB_LOCAL = "email_patterns.db"
+PATTERN_DB_PATH = PATTERN_DB_LOCAL
 
 def ensure_local_pattern_db():
     """Download the .db file from remote URL if not already local."""
@@ -675,6 +676,7 @@ if "merged_df" in st.session_state:
     )
 
 # End of app
+
 
 
 
